@@ -2,6 +2,10 @@
 #include <FastIMU.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "BLEDevice.h"
+#include "BLEServer.h"
+#include "BLEUtils.h"
+#include "BLE2902.h"
 
 #define SDA_PIN 21
 #define SCL_PIN 22
@@ -17,6 +21,28 @@ MPU6500 IMU(Wire);
 AccelData accel;
 GyroData gyro;
 calData calibration;
+
+// BLE variables
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+// BLE UUIDs
+#define SERVICE_UUID        "12345678-1234-1234-1234-123456789abc"
+#define CHARACTERISTIC_UUID "87654321-4321-4321-4321-cba987654321"
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("BLE Client connected");
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("BLE Client disconnected");
+    }
+};
 
 // ---- STATE VARIABLES ----
 String prevFaceUp = "";
@@ -62,6 +88,35 @@ void setup() {
   }
 
   Serial.println("Focus Cube Ready");
+  
+  // Initialize BLE
+  BLEDevice::init("FocusCube");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ |
+                      BLECharacteristic::PROPERTY_WRITE |
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+
+  pCharacteristic->addDescriptor(new BLE2902());
+  
+  pService->start();
+  
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);  // functions that help with iPhone connections issue
+  pAdvertising->setMinPreferred(0x12);
+  pAdvertising->start();
+  
+  Serial.println("BLE started - device name: FocusCube");
+  Serial.println("Look for 'FocusCube' in your phone's BLE scanner");
+  
   delay(2000);
 }
 
@@ -139,6 +194,39 @@ String getFaceUp() {
   return "unknown";
 }
 
+void updateBLEData() {
+  // Calculate current elapsed time
+  unsigned long elapsed;
+  if (buttonPressed && timerRunning) {
+    unsigned long currentSessionTime = millis() - timerStartTime;
+    elapsed = (totalElapsedTime + currentSessionTime) / 1000;
+  } else {
+    elapsed = totalElapsedTime / 1000;
+  }
+  
+  // Create JSON data string
+  String data = "{";
+  data += "\"mode\":\"" + currentMode + "\",";
+  data += "\"time\":" + String(elapsed) + ",";
+  data += "\"active\":" + String(buttonPressed ? "true" : "false") + ",";
+  data += "\"running\":" + String(timerRunning ? "true" : "false");
+  data += "}\n";
+  
+  // Send data over BLE
+  if (deviceConnected && pCharacteristic != nullptr) {
+    pCharacteristic->setValue(data.c_str());
+    pCharacteristic->notify();
+    Serial.println("Data sent to BLE client: " + data.substring(0, data.length()-1));
+  } else {
+    // Debug: Show we're advertising but no client connected
+    static int noClientCounter = 0;
+    if (noClientCounter % 10 == 0) {  // Every 10 seconds
+      Serial.println("BLE advertising, waiting for connection...");
+    }
+    noClientCounter++;
+  }
+}
+
 void loop() {
   IMU.update();
   IMU.getAccel(&accel);
@@ -204,6 +292,26 @@ void loop() {
   
   // Update display
   drawTimer();
+  
+  // Handle BLE connection changes
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(500); // give the bluetooth stack time to get things ready
+    pServer->startAdvertising(); // restart advertising
+    Serial.println("Restarting BLE advertising");
+    oldDeviceConnected = deviceConnected;
+  }
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+  }
+  
+  // Update BLE data every few cycles
+  static int bleUpdateCounter = 0;
+  if (bleUpdateCounter >= 3) {  // Update every ~1 second (3 * 300ms)
+    updateBLEData();
+    bleUpdateCounter = 0;
+  } else {
+    bleUpdateCounter++;
+  }
   
   // Debug output
   Serial.print("Face: ");
